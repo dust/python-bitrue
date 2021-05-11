@@ -3,5 +3,5 @@ twisted
 ujson
 requests
 pyOpenSSL
-autobohn
+autobahn
 service_identity
