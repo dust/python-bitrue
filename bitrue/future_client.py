@@ -1,18 +1,25 @@
 # coding=utf-8
 
+
 import hashlib
 import hmac
 import requests
 import time
+from urllib.parse import urlparse
 from operator import itemgetter
 from bitrue.helpers import date_to_milliseconds, interval_to_milliseconds, extend
 from bitrue.exceptions import BitrueAPIException, BitrueRequestException
 
+try:
+    import simplejson as json
+except Exception as ex:
+    import json
 
-class Client(object):
+class FutureClient(object):
 
-    API_URL = 'https://www.bitrue.{}/api'
-    WEBSITE_URL = 'https://www.bitrue.{}'
+    API_URL = 'https://fapi.bitrue.{}/fapi'        # 'https://futuresopenapi.byqian.{}/fapi'
+    FUTURES_URL = 'https://fapi.bitrue.{}/fapi'    # 'https://futuresopenapi.byqian.{}/fapi'
+    WEBSITE_URL = 'https://www.bitrue.{}'          # 'https://www.byqian.{}'
     
     PUBLIC_API_VERSION = 'v1'
     PRIVATE_API_VERSION = 'v1'
@@ -87,7 +94,7 @@ class Client(object):
         # self.WITHDRAW_API_URL = self.WITHDRAW_API_URL.format(tld)
         # self.MARGIN_API_URL = self.MARGIN_API_URL.format(tld)
         self.WEBSITE_URL = self.WEBSITE_URL.format(tld)
-        # self.FUTURES_URL = self.FUTURES_URL.format(tld)
+        self.FUTURES_URL = self.FUTURES_URL.format(tld)
         # self.FUTURES_DATA_URL = self.FUTURES_DATA_URL.format(tld)
         # self.FUTURES_COIN_URL = self.FUTURES_COIN_URL.format(tld)
         # self.FUTURES_COIN_DATA_URL = self.FUTURES_COIN_DATA_URL.format(tld)
@@ -120,40 +127,39 @@ class Client(object):
     def _create_website_uri(self, path):
         return self.WEBSITE_URL + "/" + path
     
-    def _generate_signature(self, data):
-        # ordered_data = self._order_params(data)
-        query_string = '&'.join(["{}={}".format(k, v) for k, v in data.items()])
-        m = hmac.new(self.API_SECRET.encode("utf-8"), query_string.encode('utf-8'), hashlib.sha256)
-        return m.hexdigest()
-    
-    def _order_params(self, data):
-        """Convert params to list with signature as last element.
+    def _generate_signature(self, ts, method, path, params={}, payload=None):
+        # sig_explain = '&'.join(["{}={}".format(k, v) for k, v in body.items()])
+        if params:
+            qs = '&'.join(["{}={}".format(k, v) for k, v in params.items()])
+            if path.find('?') > -1:
+                qs = "?" + qs
+            sig_explain = "%d%s%s%s%s" %(ts, method.upper(), path, qs, "" if not payload else payload)
+        else:
+            sig_explain = "%d%s%s%s" %(ts, method.upper(), path, "" if not payload else payload)
+        print("\n\n", sig_explain, "\n\n")
 
-        Args:
-            data ([type]): [description]
-        """
-        has_signature = False
-        params = []
-        for k, v in data.items():
-            if k == 'signature':
-                has_signature = True
-            else:
-                params.append((k, v))
-        # sort parameters by key
-        if has_signature:
-            params.append(('signature', data['signature']))
-        return params
+        m = hmac.new(self.API_SECRET.encode("utf-8"), sig_explain.encode('utf-8'), hashlib.sha256)
+        return m.hexdigest()
     
     def _reqeust(self, method, uri, signed, force_params=False, **kwargs):
 
         # set default request timeout
         kwargs['timeout'] = 10
+        headers = None
 
         # add our global requests params
         if self._requests_params:
             kwargs.update(self._requests_params)
         
+        a_payload = None
         data = kwargs.get('data', None)
+
+        # if get request assign data array to params value for requests lib
+        if data and (method == 'get' or force_params):
+            kwargs['params'] = '&'.join('%s=%s' %(data[0], data[1]) for data in kwargs['data'])
+            del(kwargs['data'])
+            data = None
+
         if data and isinstance(data, dict):
             kwargs['data'] = data
 
@@ -162,25 +168,31 @@ class Client(object):
                 # merge requests params into kwargs
                 kwargs.update(kwargs['data']['requests_params'])
                 del(kwargs['data']['requests_params'])
-        
-        if signed:
-            # generate signature
-            kwargs['data']['timestamp'] = int(time.time() * 1000 + self.timestamp_offset)
-            kwargs['data']['signature'] = self._generate_signature(kwargs['data'])
-        
-        # sort get and post params to match signature order
-        if data:
-            # sort post params
-            kwargs['data'] = self._order_params(kwargs['data'])
-            # remove any arguments with values of None
-            null_args = [i for i, (k, v) in enumerate(kwargs['data']) if v is None]
-            for i in reversed(null_args):
-                del(kwargs['data'][i])
-        
-        # if get request assign data array to params value for requests lib
-        if data and (method == 'get' or force_params):
-            kwargs['params'] = '&'.join('%s=%s' %(data[0], data[1]) for data in kwargs['data'])
+             
+            if method == 'get' or force_params:
+                kwargs['params'] = '&'.join('%s=%s' %(data[0], data[1]) for data in kwargs['data'])
+            else:
+                a_payload = json.dumps(kwargs['data'])
+                kwargs['json'] = kwargs['data']
             del(kwargs['data'])
+        
+        headers =  {'Content-Type': 'application/json'}
+
+        if signed:
+            ts = int(time.time() * 1000 + self.timestamp_offset)
+            pr = urlparse(uri)
+            path = pr.path
+            if pr.query:
+                path = path.join(['?', pr.query])
+
+            # generate signature
+            headers['X-CH-TS'] = str(ts)
+            headers['X-CH-APIKEY'] = self.API_KEY
+            headers['X-CH-SIGN'] = self._generate_signature(ts, method, path, params=kwargs.get('params',{}), payload=a_payload)
+        # print(headers)
+        kwargs.update({'headers' :headers})
+        print(kwargs)
+        
         self.response = getattr(self.session, method)(uri, **kwargs)
         return self._handle_response()
     
@@ -216,54 +228,45 @@ class Client(object):
     def _delete(self, path, signed=False, version=PUBLIC_API_VERSION, **kwargs):
         return self._request_api('delete', path, signed, version, **kwargs)
     
-    # exchange endpoints
+    # public endpoints
+    def get_time(self):
+        return self.get_server_time()
+
     def get_server_time(self):
         return self._get('time')
     
     def ping(self):
         return self._get('ping')
 
-    def get_exchange_info(self):
-        return self._get('exchangeInfo')
+    def get_contracts(self):
+        return self._get('contracts')
     
     def get_symbol_info(self, symbol):
-        res = self.get_exchange_info()
+        res = self.get_contracts()
 
-        for item in res['symbols']:
+        for item in res:
             if item['symbol'] == symbol.upper():
                 return item
         return None
     
-    def get_all_tickers(self):
-        """24 hour price change statistics. Careful when accessing this with no symbol.
-
-            Weight: 1 for a single symbol; 40 when the symbol parameter is omitted
-        Returns:
-            [type]: [description]
-        """
-        return self._get('ticker/24hr')
-    
     def get_ticker(self, **params):
-        return self._get('ticker/price', data=params)
+        return self._get('ticker', params=params)
     
-    def get_orderbook_ticker(self, **params):
-        return self._get("ticker/bookTicker", data=params)
+    def get_index(self, **params):
+        return self._get("index", params=params)
     
     def get_order_book(self, **params):
-        return self._get("depth", data=params)
+        return self._get("depth", params=params)
     
-    def get_recent_trades(self, **params):
-        return self._get('trades', data=params)
-
-    def get_historical_trades(self, **params):
-        return self._get('historicalTrades', data=params)
-    
-    def get_aggregate_trades(self, **params):
-        return self._get('aggTrades', data=params)
+    def get_klines(self, **params):
+        return self._get("klines", params=params)
     
     # Account Endpoints
 
     def create_order(self, **params):
+        """
+        volume, price, contractName, type, side, open, position, clientOrderId, timeInForce
+        """
         return self._post('order', True, data=params)
 
     def order_limit(self, timeInForce=TIME_IN_FORCE_GTC, **params):
@@ -324,7 +327,7 @@ class Client(object):
     def cancel_order(self, **params):
         """Cancel an active order. Either orderId or origClientOrderId must be sent.
         """
-        return self._delete('order', True, data=params)
+        return self._post('cancel', True, data=params)
     
     def get_open_orders(self, **params):
         """Get all open orders on a symbol.
@@ -353,6 +356,6 @@ class Client(object):
     def get_my_trades(self, **params):
         """Get trades for a specific symbol.
         """
-        return self._get('myTrades', True, data=params)
+        return self._get('myTrades', True, params=params)
 
 
