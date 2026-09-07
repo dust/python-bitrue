@@ -260,6 +260,9 @@ class Client(object):
     
     def get_aggregate_trades(self, **params):
         return self._get('aggTrades', data=params)
+
+    def get_kline(self, **params):
+        return self._get("market/kline", data=params)
     
     # Account Endpoints
 
